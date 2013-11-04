@@ -29,6 +29,8 @@ import pwd
 import socket
 import sys
 from Queue import Queue
+import itertools
+import collections
 
 log = logging.getLogger('tableslurp')
 stderr = logging.StreamHandler()
@@ -107,29 +109,49 @@ class DownloadHandler(object):
 
     def _build_file_set(self, target_file=None):
         log.info('Building fileset')
-        key = None
+        keys = []
 #       If you want to restore a file-set in particular
         bucket = self._get_bucket()
         if target_file:
-            key = bucket.get_key('%s/%s-listdir.json' %
-                (self.prefix, target_file))
+            keys = [bucket.get_key('%s/%s-listdir.json' %
+                (self.prefix, target_file))]
 #       Otherwise try to fetch the most recent one
         else:
-            prefix_part_count = self.prefix.count('/') + 1
-            keys = [_ for _ in bucket.list(prefix='%s/' %
-                (self.prefix,)) if _.name.endswith('-listdir.json') and _.name.count('/') == prefix_part_count]
-            if keys:
-                keys.sort(key=lambda l: parser.parse(l.last_modified))
-                key = keys.pop()
+            partitioned_keys = collections.defaultdict(list)
 
-        if not key:
+            # Partition the keys by directory (Column Family)
+            # Assumes /././<CF_NAME>/<FILENAME> pattern
+            for key in itertools.ifilter(
+                    lambda k: k.key.endswith("-listdir.json"),
+                    bucket.list(prefix='%s/' % (self.prefix,))):
+                directory = key.key.split("/")[-2]
+                partitioned_keys[directory].append(key)
+
+            # Grab most recently updated file for each directory
+            for _, ks in partitioned_keys.iteritems():
+                ks.sort(key=lambda l: parser.parse(l.last_modified))
+                keys.append(ks.pop())
+
+        keys = list(itertools.ifilter(None, keys))
+
+        if not keys:
             raise LookupError('Cannot find anything to restore from %s:%s/%s' %
                 (bucket.name, self.prefix, target_file or ''))
 
-        json_data = json.loads(key.get_contents_as_string())
-        self.fileset = json_data[self.origin]
+        # Generate the fileset list by iterating over the keys for each CF and
+        # retrieving the valid files from the JSON.
+        for key in keys:
+            json_data = json.loads(key.get_contents_as_string())
+            assert len(json_data.keys()) == 1, "Invalid JSON format, aborting."
+
+            # Prepend directory (CF name) to filename so we can restore to
+            # that directory if we're restoring an entire keyspace.
+            directory = json_data.keys()[0].split("/")[-1]
+            filenames = ["%s/%s" % (directory, f) for f in json_data.values()[0]]
+            self.fileset.extend(filenames)
+
         log.info('Fileset contains %d files to download' % (len(self.fileset)))
-        k = bucket.get_key('%s/%s' % (self.prefix, self.fileset[0]))
+        k = bucket.get_key(keys[0].key)
 #       The librato branch introduced this
         meta = k.get_metadata('stat')
         log.debug('Metadata is %s' % (meta,))
@@ -173,8 +195,17 @@ class DownloadHandler(object):
         while queue.empty() == False:
             queueddownload = queue.get()
             fname = queueddownload.filename
-            keypath = '%s/%s' % (self.prefix, fname,)
-            destfile = os.path.join(self.target, os.path.basename(fname))
+            directory = fname.split("/")[:1][0]
+            # If the prefix ends with the name of a Column Family, we assume
+            # that we are only restoring a single CF. If the prefix does not
+            # end with the name of a CF we will create directories for each
+            # individual CF.
+            if self.prefix.endswith(directory):
+                keypath = '%s/%s' % (self.prefix, fname.split("/")[1],)
+                destfile = os.path.join(self.target, os.path.basename(fname))
+            else:
+                keypath = '%s/%s' % (self.prefix, fname,)
+                destfile = os.path.join(self.target, directory, os.path.basename(fname))
 
             log.debug('Checking if we need to download %s to %s' %
                 (keypath, destfile,))
@@ -218,14 +249,38 @@ class DownloadHandler(object):
 
         log.info('Thread #%d finished processing' % (idx,))
 
+    # If the prefix ends with the name of a Column Family, we assume that
+    # we are only restoring a single CF. If the prefix does not end with
+    # the name of a CF we create directories for each individual CF.
+    def _create_cf_directories(self, cf_names):
+
+        create_dirs = all(not self.prefix.endswith(cf) for cf in cf_names)
+
+        if not create_dirs:
+            return
+
+        for cf_name in cf_names:
+            directory = os.path.join(self.target, cf_name)
+            try:
+                os.mkdir(directory)
+                os.chown(directory, self.owner, self.group)
+                log.info('Created %s' % directory)
+            except OSError, e:
+                log.error('Error creating directory: %s' % e)
+                pass
+
     def run(self):
         self._test_permissions()
         log.info('Running')
+        cf_directories = set()
 
         #queue up the filesets
         for filename in self.fileset:
             log.info('Pushing file %s onto queue' % filename)
             self.queue.put(DownloadCounter(filename))
+            cf_directories.add(os.path.split(filename)[0])
+
+        self._create_cf_directories(cf_directories)
 
 #       launch threads and attach an event to them
         for idx in range(0, self.num_threads):
