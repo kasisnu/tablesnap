@@ -28,6 +28,7 @@ import os
 import pwd
 import socket
 import sys
+import errno
 from Queue import Queue
 import itertools
 import collections
@@ -65,6 +66,8 @@ class DownloadHandler(object):
     origin = None
     prefix = None
     force = False
+    global_index = False
+    dry_run = False
     name = socket.getfqdn()
     fileset = []
     queue = Queue()
@@ -80,6 +83,9 @@ class DownloadHandler(object):
         self.bucket_name = args.bucket[0]
         self.num_threads = args.threads
         self.force = args.force
+        self.global_index = args.global_index
+        self.dry_run = args.dry_run
+
         if args.name:
             self.name = args.name
         self.prefix = '%s:%s' % (self.name, self.origin)
@@ -228,9 +234,20 @@ class DownloadHandler(object):
                         download = True
 
                     if download and key:
-                        log.info('Downloading %s from %s to %s' %
-                            (key.name, bucket.name, destfile))
-                        key.get_contents_to_filename(destfile)
+                        if self.dry_run:
+                            log.debug('Not creating dir %s' % (os.path.dirname(destfile)))
+                            log.info('Not downloading %s from %s to %s' %
+                                (key.name, bucket.name, destfile))
+                        else:
+                            log.debug('Creating dir %s' % (os.path.dirname(destfile)))
+                            try:
+                                os.makedirs(os.path.dirname(destfile))
+                            except OSError as exc:
+                                if exc.errno == errno.EEXIST:
+                                    pass
+                            log.info('Downloading %s from %s to %s' %
+                                (key.name, bucket.name, destfile))
+                            key.get_contents_to_filename(destfile)
 
                 except Exception as e:
                     log.debug(e)
@@ -324,6 +341,11 @@ def main():
         'instead of the latest one available.')
     ap.add_argument('--force', default=False, action='store_true',
         help='Force download files even if they exist')
+    ap.add_argument('--global-index', default=False, action='store_true',
+        help='Use a global index to retrieve all files from all backed'
+        ' up directories. This is useful for multi-datadir (JBOD) cassandra')
+    ap.add_argument('--dry-run', default=False, action='store_true',
+        help='Don\'t actually download any files, just verify they\'re available')
     ap.add_argument('-n', '--name', default=socket.getfqdn(),
         help='Use this name instead of the FQDN to prefix the bucket dir')
     ap.add_argument('bucket', nargs=1,
