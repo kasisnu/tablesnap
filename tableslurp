@@ -28,6 +28,7 @@ import os
 import pwd
 import socket
 import sys
+import errno
 from Queue import Queue
 import itertools
 import collections
@@ -228,6 +229,12 @@ class DownloadHandler(object):
                         download = True
 
                     if download and key:
+                        log.debug('Creating dir %s' % (os.path.dirname(destfile)))
+                        try:
+                            os.makedirs(os.path.dirname(destfile))
+                        except OSError as exc:
+                            if exc.errno == errno.EEXIST:
+                                pass
                         log.info('Downloading %s from %s to %s' %
                             (key.name, bucket.name, destfile))
                         key.get_contents_to_filename(destfile)
